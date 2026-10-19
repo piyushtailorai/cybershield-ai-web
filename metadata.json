@@ -1,0 +1,6 @@
+{
+  "name": "CyberShield AI",
+  "description": "AI-Powered Threat Detection, Neural Link Defense, 2026 Security Telemetry & Innovation Roadmap.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
