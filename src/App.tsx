@@ -30,7 +30,143 @@ interface AdvisoryItem {
   remediation: string;
 }
 
-export type SimulatedAttackType = 'ddos' | 'phishing' | 'ransomware';
+export type SimulatedAttackType = 'ddos' | 'phishing' | 'ransomware' | 'custom_payload';
+
+export interface AnalysisError {
+  code: string;
+  title: string;
+  message: string;
+  remediation: string;
+  details?: string;
+  timestamp: string;
+}
+
+export function validateTargetPayload(
+  input: string,
+  mode: 'url' | 'ip' | 'payload' = 'payload'
+): { isValid: boolean; error?: AnalysisError } {
+  const trimmed = (input || '').trim();
+  const now = new Date();
+  const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+
+  // 1. Check for empty or whitespace-only
+  if (!trimmed) {
+    return {
+      isValid: false,
+      error: {
+        code: 'ERR_EMPTY_PAYLOAD_BUFFER',
+        title: 'Empty Payload / Zero-Byte Vector',
+        message: 'The neural analysis engine received an empty or null-byte stream. Analysis cannot proceed without valid target input data.',
+        remediation: 'Provide a target URL, IP address, or raw bytecode string before initiating inspection.',
+        timestamp: timeStr
+      }
+    };
+  }
+
+  // 2. Buffer overflow protection (> 65KB)
+  if (trimmed.length > 65536) {
+    return {
+      isValid: false,
+      error: {
+        code: 'ERR_PAYLOAD_BUFFER_OVERFLOW',
+        title: 'Ingress Frame Limit Exceeded (> 64KB)',
+        message: `Payload size (${trimmed.length} bytes) exceeds maximum allowable buffer threshold for real-time memory sandboxing.`,
+        remediation: 'Truncate the payload buffer or stream via chunked telemetry gRPC.',
+        details: 'Bounds overflow at offset 0xFFFF in enclave allocation.',
+        timestamp: timeStr
+      }
+    };
+  }
+
+  // 3. Mode-specific malformed validation
+  if (mode === 'url') {
+    if (trimmed.startsWith('http:///') || trimmed.startsWith('https:///') || trimmed === 'http://' || trimmed === 'https://') {
+      return {
+        isValid: false,
+        error: {
+          code: 'ERR_MALFORMED_URI_STRUCTURE',
+          title: 'Malformed URI / Protocol Scheme',
+          message: 'The target URL contains an illegal authority separator or missing host domain per RFC-3986.',
+          remediation: 'Format: https://domain.tld/path (e.g. https://secure-login-verify-account.com/auth).',
+          details: 'URI parser halted on null hostname token.',
+          timestamp: timeStr
+        }
+      };
+    }
+
+    if (!trimmed.includes('.') && !trimmed.includes('localhost') && !trimmed.includes('127.0.0.1')) {
+      return {
+        isValid: false,
+        error: {
+          code: 'ERR_MISSING_FQDN_TLD',
+          title: 'Missing Top-Level Domain (TLD)',
+          message: 'Target host is not a valid fully-qualified domain name (FQDN).',
+          remediation: 'Ensure the target host specifies a valid TLD (e.g. .com, .io, .net).',
+          details: 'DNS resolver rejected bare hostname string.',
+          timestamp: timeStr
+        }
+      };
+    }
+  } else if (mode === 'ip') {
+    const rawHost = trimmed.split(':')[0].trim();
+    const octets = rawHost.split('.');
+    if (octets.length === 4 && octets.every(o => /^\d+$/.test(o))) {
+      const outOfRange = octets.some(o => parseInt(o, 10) > 255);
+      if (outOfRange) {
+        return {
+          isValid: false,
+          error: {
+            code: 'ERR_INVALID_IPV4_OCTET',
+            title: 'IPv4 Address Octet Out of Range (> 255)',
+            message: `One or more octets in "${rawHost}" exceed the allowable 8-bit boundary (0-255).`,
+            remediation: 'Verify standard IPv4 dotted-decimal formatting (0.0.0.0 - 255.255.255.255).',
+            details: 'Kernel socket validation fault: 0x7F000001 out of bounds.',
+            timestamp: timeStr
+          }
+        };
+      }
+    }
+  } else {
+    // Raw payload mode
+    // Base64 validation
+    const atobMatch = trimmed.match(/atob\s*\(\s*["']([^"']+)["']\s*\)/i);
+    if (atobMatch) {
+      const b64 = atobMatch[1];
+      try {
+        atob(b64);
+      } catch (err) {
+        return {
+          isValid: false,
+          error: {
+            code: 'ERR_MALFORMED_BASE64_BYTECODE',
+            title: 'Malformed Base64 Bytecode Sequence',
+            message: 'Deobfuscation decoder trapped an unhandled Base64 padding or invalid character exception.',
+            remediation: 'Ensure Base64 payload length is a multiple of 4 and uses valid RFC-4648 characters.',
+            details: String(err),
+            timestamp: timeStr
+          }
+        };
+      }
+    }
+
+    // Broken Hex escape sequences (\x followed by non-hex or truncated)
+    if (/\\x(?![0-9a-fA-F]{2})/i.test(trimmed)) {
+      return {
+        isValid: false,
+        error: {
+          code: 'ERR_CORRUPT_HEX_SHELLCODE',
+          title: 'Corrupted Hex Shellcode Escape Sequence',
+          message: 'Lexer encountered malformed \\x bytecode sequence missing 2-character hexadecimal nibbles.',
+          remediation: 'Format hex byte escapes strictly as \\x00 through \\xFF (e.g. \\x41\\x42\\x43).',
+          details: 'Syntax parser trapped unaligned hex literal in payload chamber.',
+          timestamp: timeStr
+        }
+      };
+    }
+  }
+
+  return { isValid: true };
+}
 
 export interface SimulatorLogEntry {
   id: string;
@@ -153,6 +289,16 @@ export default function App() {
     defenseEngineStatus: 'STANDBY // MONITORING'
   });
 
+  // Input Validation, Loading States & Error Banners (Day 6 Upgrade)
+  const [scannerError, setScannerError] = useState<AnalysisError | null>(null);
+  const [simulatorError, setSimulatorError] = useState<AnalysisError | null>(null);
+  const [customPayloadInput, setCustomPayloadInput] = useState<string>(
+    'eval(atob("ZG9jdW1lbnQubG9jYXRpb249J2h0dHA6Ly9tYWxpY2lvdXMtZGVzdC5jb20nOw=="));'
+  );
+  const [isAnalyzingPayload, setIsAnalyzingPayload] = useState<boolean>(false);
+  const [payloadStage, setPayloadStage] = useState<string>('');
+  const [payloadProgress, setPayloadProgress] = useState<number>(0);
+
   // Periodic latency simulation for tactical SOC feel (pauses during active attack pulse)
   useEffect(() => {
     if (pulseAnimationActive) return;
@@ -164,6 +310,7 @@ export default function App() {
 
   const handleTabChange = (tab: ScanMode) => {
     setActiveTab(tab);
+    setScannerError(null);
     if (tab === 'url') {
       setScanInput('https://secure-login-verify-account.com/auth-token');
     } else if (tab === 'ip') {
@@ -175,10 +322,32 @@ export default function App() {
 
   const handlePreset = (val: string) => {
     setScanInput(val);
+    setScannerError(null);
   };
 
   const triggerScan = (customTarget?: string) => {
-    const target = customTarget || scanInput;
+    const target = customTarget !== undefined ? customTarget : scanInput;
+    setScannerError(null);
+
+    // Day 6 Input Validation
+    const validation = validateTargetPayload(target, activeTab);
+    if (!validation.isValid && validation.error) {
+      setScannerError(validation.error);
+      const timeStr = new Date().toTimeString().split(' ')[0];
+      setSimulatorLogs(prev => [
+        {
+          id: `LOG-${Date.now()}`,
+          time: timeStr,
+          type: 'CRITICAL',
+          vector: 'INPUT-SANITIZER',
+          badge: 'VALIDATION REJECTED',
+          message: `Scanner input rejected: ${validation.error!.title} (${validation.error!.code}). Target: "${target.substring(0, 24)}...". Analysis aborted safely.`
+        },
+        ...prev
+      ]);
+      return; // Handles empty/malformed inputs without crashing!
+    }
+
     setIsScanning(true);
     setScanStage('Deconstructing URI & Network Vectors...');
 
@@ -480,6 +649,144 @@ export default function App() {
     ]);
   };
 
+  // Day 6: Custom Adversary Payload Fuzzer & Analysis Handlers
+  const handleAnalyzeCustomPayload = () => {
+    setSimulatorError(null);
+
+    // Validate payload against empty, malformed Base64, corrupt hex, or overflow
+    const validation = validateTargetPayload(customPayloadInput, 'payload');
+    if (!validation.isValid && validation.error) {
+      setSimulatorError(validation.error);
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      setSimulatorLogs(prev => [
+        {
+          id: `LOG-${Date.now()}`,
+          time: timeStr,
+          type: 'CRITICAL',
+          vector: 'PAYLOAD-PARSER',
+          badge: 'PRE-FLIGHT REJECT',
+          message: `Sanitizer trapped malformed vector: ${validation.error!.title} (${validation.error!.code}). Sandbox uncorrupted.`
+        },
+        ...prev
+      ]);
+      return; // Gracefully halts without crashing
+    }
+
+    // Begin Loading State
+    setIsAnalyzingPayload(true);
+    setPayloadProgress(20);
+    setPayloadStage('Step 1/3: Micro-Enclave Sandbox Allocation & Lexical Sanitization...');
+
+    setTimeout(() => {
+      setPayloadProgress(55);
+      setPayloadStage('Step 2/3: Dynamic Bytecode Hook & Syscall Interception...');
+    }, 600);
+
+    setTimeout(() => {
+      setPayloadProgress(85);
+      setPayloadStage('Step 3/3: Correlating with 140+ Neural Weight Tensors...');
+    }, 1200);
+
+    setTimeout(() => {
+      setIsAnalyzingPayload(false);
+      setPayloadProgress(100);
+      setPayloadStage('');
+
+      // Successful analysis result
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+
+      setCurrentThreat({
+        id: `#CX-CUSTOM-${Math.floor(1000 + Math.random() * 9000)}`,
+        target: customPayloadInput.length > 34 ? customPayloadInput.substring(0, 34) + '...' : customPayloadInput,
+        score: 87,
+        riskLevel: 'HIGH',
+        signatures: 29,
+        anomalies: 6,
+        reputation: '18.2%',
+        scanTime: 'Just now',
+        category: 'Custom Adversary Bytecode Vector Neutralized'
+      });
+
+      setLiveLatency(64);
+      setThreatsNeutralizedCount(prev => prev + 120);
+      setLossesPreventedCount(prev => +(prev + 0.4).toFixed(2));
+      setPulseAnimationActive(true);
+      setTimeout(() => setPulseAnimationActive(false), 2800);
+
+      // Append alert advisory
+      const newAdvisory: AdvisoryItem = {
+        id: `ADV-CUSTOM-${Date.now()}`,
+        cve: 'CVE-2026-9811',
+        title: 'Custom Obfuscated Bytecode Injection Vector',
+        severity: 'HIGH',
+        score: '8.7',
+        timeAgo: 'Just now',
+        summary: 'Deobfuscated synthetic script targeting corporate execution memory hooks halted in sandbox enclave.',
+        remediation: 'Enable runtime script isolation and restrict eval/atob dynamic function compilation.'
+      };
+      setAdvisories(prev => [newAdvisory, ...prev]);
+
+      setSimulatorLogs(prev => [
+        {
+          id: `LOG-${Date.now()}-1`,
+          time: timeStr,
+          type: 'CRITICAL',
+          vector: 'SANDBOX-EXEC',
+          badge: 'PAYLOAD DETONATED',
+          message: `Custom payload analyzed in isolated hypervisor. 29 malicious patterns quarantined with zero host escape.`
+        },
+        {
+          id: `LOG-${Date.now()}-2`,
+          time: timeStr,
+          type: 'MITIGATION',
+          vector: 'HEURISTIC-LOCK',
+          badge: 'ISOLATION SECURE',
+          message: `Threat gauge raised to 87/100 HIGH. Synthetic enclave recycled in 24ms.`
+        },
+        ...prev
+      ]);
+    }, 1800);
+  };
+
+  const handleSimulateAnalysisFailure = () => {
+    setSimulatorError(null);
+    setIsAnalyzingPayload(true);
+    setPayloadProgress(35);
+    setPayloadStage('Detonating Intentionally Corrupted Memory Payload...');
+
+    setTimeout(() => {
+      setIsAnalyzingPayload(false);
+      setPayloadProgress(0);
+      setPayloadStage('');
+
+      const timeStr = new Date().toTimeString().split(' ')[0];
+      const failureError: AnalysisError = {
+        code: 'ERR_SANDBOX_SIGSEGV_FAULT',
+        title: 'Micro-Chamber Sandbox Fault (SIGSEGV / Access Violation)',
+        message: 'The neural analysis engine trapped an unaligned memory dereference (0xC0000005) inside the virtualized hypervisor. Malformed payload caused a hardware isolation fault.',
+        remediation: 'Inspect bytecode alignment, verify binary PE/ELF header checksums, or click "Auto-Sanitize & Retry".',
+        details: 'Trapped at virtual RIP: 0x7FFF8A42110B in neural_sandbox_v4.sys. Hypervisor safely isolated without crashing host.',
+        timestamp: timeStr
+      };
+
+      setSimulatorError(failureError);
+
+      setSimulatorLogs(prev => [
+        {
+          id: `LOG-${Date.now()}`,
+          time: timeStr,
+          type: 'CRITICAL',
+          vector: 'HYPERVISOR-FAULT',
+          badge: 'ANALYSIS FAILED',
+          message: `CRITICAL: Analysis faulted gracefully (ERR_SANDBOX_SIGSEGV_FAULT). Enclave memory wiped to preserve host integrity.`
+        },
+        ...prev
+      ]);
+    }, 1200);
+  };
+
   // Circumference calculation for 40px radius circle: 2 * pi * 40 ≈ 251.2
   const maxCircumference = 251.2;
   const strokeDashoffset = maxCircumference - (maxCircumference * currentThreat.score) / 100;
@@ -586,10 +893,50 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        {/* Mobile Sub-Navigation Strip */}
+        <div className="flex md:hidden items-center justify-between gap-1 px-4 py-2 border-t border-[#3d494c]/25 bg-[#0a0e18]/95 overflow-x-auto font-mono text-[11px]">
+          <div className="flex items-center gap-1 shrink-0">
+            <a
+              href="#scanner"
+              className="px-2.5 py-1 rounded bg-[#262a35] text-[#4cd7f6] font-semibold transition-colors"
+            >
+              Scanner
+            </a>
+            <a
+              href="#threat-intel"
+              className="px-2.5 py-1 rounded text-[#bcc9cd] hover:text-[#dfe2f1] transition-colors"
+            >
+              Intel
+            </a>
+            <a
+              href="#threat-simulator"
+              className={`px-2.5 py-1 rounded font-semibold transition-colors flex items-center gap-1 ${
+                activeSimulation
+                  ? 'bg-[#ff7f8b]/20 text-[#ffb4ab] border border-[#ff7f8b]/40 animate-pulse'
+                  : 'text-[#4cd7f6] hover:text-[#ffb4ab]'
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${activeSimulation ? 'bg-[#ff7f8b] animate-ping' : 'bg-[#4cd7f6]'}`} />
+              Simulator
+            </a>
+            <a
+              href="#roadmap"
+              className="px-2.5 py-1 rounded text-[#bcc9cd] hover:text-[#dfe2f1] transition-colors"
+            >
+              Roadmap
+            </a>
+          </div>
+
+          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[#171b26] border border-[#3d494c]/30 text-[10px] text-[#4edea3] shrink-0 font-semibold ml-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#4edea3] animate-ping" />
+            <span>{liveLatency}ms</span>
+          </div>
+        </div>
       </header>
 
       {/* MAIN CONTENT AREA */}
-      <main className="w-full pt-20 flex-1 flex flex-col relative z-10">
+      <main className="w-full pt-28 md:pt-20 flex-1 flex flex-col relative z-10">
         <div className="w-full max-w-7xl mx-auto px-4 md:px-8 flex flex-col gap-10 py-6 md:py-10">
 
           {/* 1. HERO SCANNING CONSOLE */}
@@ -617,11 +964,11 @@ export default function App() {
             </div>
 
             {/* Mode Switcher Tabs */}
-            <div className="mt-6 flex items-center bg-[#0a0e18] p-1 rounded-xl border border-[#3d494c]/30 shadow-inner gap-1">
+            <div className="mt-6 flex flex-wrap sm:flex-nowrap items-center justify-center bg-[#0a0e18] p-1 rounded-xl border border-[#3d494c]/30 shadow-inner gap-1 w-full max-w-sm sm:max-w-none">
               <button
                 type="button"
                 onClick={() => handleTabChange('url')}
-                className={`flex items-center gap-1.5 px-4 py-1.5 rounded-lg font-mono text-xs font-semibold transition-all cursor-pointer ${
+                className={`flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 sm:px-4 py-2 sm:py-1.5 rounded-lg font-mono text-xs font-semibold transition-all cursor-pointer ${
                   activeTab === 'url'
                     ? 'text-[#00424f] bg-[#06b6d4] shadow-[0_0_12px_rgba(6,182,212,0.5)]'
                     : 'text-[#bcc9cd] hover:text-[#dfe2f1] hover:bg-[#1c1f2a]'
@@ -634,7 +981,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => handleTabChange('ip')}
-                className={`flex items-center gap-1.5 px-4 py-1.5 rounded-lg font-mono text-xs font-semibold transition-all cursor-pointer ${
+                className={`flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 sm:px-4 py-2 sm:py-1.5 rounded-lg font-mono text-xs font-semibold transition-all cursor-pointer ${
                   activeTab === 'ip'
                     ? 'text-[#00424f] bg-[#06b6d4] shadow-[0_0_12px_rgba(6,182,212,0.5)]'
                     : 'text-[#bcc9cd] hover:text-[#dfe2f1] hover:bg-[#1c1f2a]'
@@ -647,7 +994,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => handleTabChange('payload')}
-                className={`flex items-center gap-1.5 px-4 py-1.5 rounded-lg font-mono text-xs font-semibold transition-all cursor-pointer ${
+                className={`flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 sm:px-4 py-2 sm:py-1.5 rounded-lg font-mono text-xs font-semibold transition-all cursor-pointer ${
                   activeTab === 'payload'
                     ? 'text-[#00424f] bg-[#06b6d4] shadow-[0_0_12px_rgba(6,182,212,0.5)]'
                     : 'text-[#bcc9cd] hover:text-[#dfe2f1] hover:bg-[#1c1f2a]'
@@ -669,7 +1016,10 @@ export default function App() {
                   <input
                     type="text"
                     value={scanInput}
-                    onChange={(e) => setScanInput(e.target.value)}
+                    onChange={(e) => {
+                      setScanInput(e.target.value);
+                      if (scannerError) setScannerError(null);
+                    }}
                     onKeyDown={(e) => e.key === 'Enter' && triggerScan()}
                     placeholder={
                       activeTab === 'url'
@@ -683,7 +1033,10 @@ export default function App() {
                   {scanInput && (
                     <button
                       type="button"
-                      onClick={() => setScanInput('')}
+                      onClick={() => {
+                        setScanInput('');
+                        setScannerError(null);
+                      }}
                       className="text-[#869397] hover:text-[#dfe2f1] text-xs font-mono px-1 cursor-pointer"
                     >
                       Clear
@@ -714,6 +1067,38 @@ export default function App() {
                     <span>{scanStage}</span>
                   </div>
                   <span className="text-[#4edea3]">HEURISTIC ENGINE 4.1</span>
+                </div>
+              )}
+
+              {/* Scanner Error Banner (Input Validation Failure) */}
+              {scannerError && (
+                <div className="mt-3 p-3 rounded-lg bg-[#ff7f8b]/15 border border-[#ff7f8b]/50 text-[#dfe2f1] animate-shake flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-left">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <span className="material-symbols-outlined text-[#ff7f8b] text-[20px] shrink-0 mt-0.5">warning</span>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-[10px] font-bold px-1.5 py-0.2 rounded bg-[#ff7f8b]/30 text-[#ffb4ab]">
+                          {scannerError.code}
+                        </span>
+                        <span className="font-mono text-xs font-bold text-[#ffb4ab]">
+                          {scannerError.title}
+                        </span>
+                      </div>
+                      <p className="text-[11px] sm:text-xs text-[#bcc9cd] mt-0.5">{scannerError.message}</p>
+                      {scannerError.remediation && (
+                        <p className="text-[10px] font-mono text-[#4edea3] mt-1">
+                          <strong>Fix:</strong> {scannerError.remediation}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setScannerError(null)}
+                    className="shrink-0 px-2.5 py-1 rounded bg-[#262a35] hover:bg-[#313540] text-[10px] font-mono text-[#bcc9cd] cursor-pointer self-end sm:self-auto"
+                  >
+                    Dismiss
+                  </button>
                 </div>
               )}
 
@@ -1440,6 +1825,258 @@ export default function App() {
                 </div>
               </div>
 
+            </div>
+
+            {/* ========================================================================= */}
+            {/* ADVERSARY PAYLOAD FUZZER & INPUT VALIDATION CHAMBER (Day 6 Upgrade) */}
+            {/* ========================================================================= */}
+            <div className="p-4 sm:p-5 rounded-xl bg-[#0a0e18]/90 border border-[#3d494c]/30 my-4 relative z-10 shadow-lg">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-[#3d494c]/20">
+                <div className="flex items-center gap-2">
+                  <div className="w-7 h-7 rounded-lg bg-[#06b6d4]/15 border border-[#06b6d4]/30 flex items-center justify-center text-[#4cd7f6]">
+                    <span className="material-symbols-outlined text-[16px]">bug_report</span>
+                  </div>
+                  <div>
+                    <h3 className="font-mono text-xs font-bold text-[#dfe2f1] uppercase tracking-wider">
+                      Adversary Payload Fuzzer & Validation Chamber
+                    </h3>
+                    <p className="text-[11px] text-[#bcc9cd] mt-0.5">
+                      Test automated pre-flight input sanitization against empty buffers, malformed shellcode, and trapped sandbox faults.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 self-start sm:self-auto">
+                  <span className="inline-block w-2 h-2 rounded-full bg-[#4edea3]" />
+                  <span className="font-mono text-[10px] text-[#4edea3] uppercase font-bold tracking-wider">
+                    SANITIZER ONLINE
+                  </span>
+                </div>
+              </div>
+
+              {/* Quick Preset Attack & Malformed Test Vectors */}
+              <div className="pt-3">
+                <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                  <span className="font-mono text-[10px] text-[#869397] uppercase tracking-wider shrink-0 mr-1">
+                    Fuzzer Presets:
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomPayloadInput('eval(atob("ZG9jdW1lbnQubG9jYXRpb249J2h0dHA6Ly9tYWxpY2lvdXMtZGVzdC5jb20nOw=="));');
+                      setSimulatorError(null);
+                    }}
+                    className="px-2.5 py-1 rounded bg-[#1c1f2a] hover:bg-[#262a35] text-[#bcc9cd] hover:text-[#4cd7f6] font-mono text-[11px] border border-[#3d494c]/20 transition-all cursor-pointer"
+                  >
+                    Clean Base64 Script
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomPayloadInput('   ');
+                      setSimulatorError(null);
+                    }}
+                    className="px-2.5 py-1 rounded bg-[#ff7f8b]/10 hover:bg-[#ff7f8b]/20 text-[#ffb4ab] font-mono text-[11px] border border-[#ff7f8b]/30 transition-all cursor-pointer flex items-center gap-1"
+                    title="Test empty payload validation"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">block</span>
+                    <span>Test Empty Buffer</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomPayloadInput('eval(atob("MALFORMED_B64_BYTECODE_ERR!@#$=="));');
+                      setSimulatorError(null);
+                    }}
+                    className="px-2.5 py-1 rounded bg-[#ff7f8b]/10 hover:bg-[#ff7f8b]/20 text-[#ffb4ab] font-mono text-[11px] border border-[#ff7f8b]/30 transition-all cursor-pointer flex items-center gap-1"
+                    title="Test corrupted Base64 validation"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">warning</span>
+                    <span>Malformed Base64</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomPayloadInput('\\x41\\x42\\xZZ\\x99\\xCORRUPTED_HEX_BYTE');
+                      setSimulatorError(null);
+                    }}
+                    className="px-2.5 py-1 rounded bg-[#ff7f8b]/10 hover:bg-[#ff7f8b]/20 text-[#ffb4ab] font-mono text-[11px] border border-[#ff7f8b]/30 transition-all cursor-pointer flex items-center gap-1"
+                    title="Test broken hex shellcode validation"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">warning</span>
+                    <span>Corrupt Hex Shellcode</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleSimulateAnalysisFailure}
+                    disabled={isAnalyzingPayload}
+                    className="px-2.5 py-1 rounded bg-[#f59e0b]/15 hover:bg-[#f59e0b]/25 text-[#fcd34d] font-mono text-[11px] border border-[#f59e0b]/40 transition-all cursor-pointer flex items-center gap-1 ml-auto"
+                    title="Simulate analysis execution fault and display error banner"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">report</span>
+                    <span>Simulate Sandbox Fault</span>
+                  </button>
+                </div>
+
+                {/* Input Textarea & Action Bar */}
+                <div className="mt-3 relative">
+                  <div className="relative rounded-lg bg-[#0f131d] border border-[#3d494c]/30 p-2.5 focus-within:border-[#06b6d4]/60 transition-colors">
+                    <div className="flex items-center justify-between pb-1 text-[#869397] font-mono text-[10px] border-b border-[#3d494c]/20">
+                      <span>RAW ADVERSARY BUFFER // RFC-822 / HEX / BASE64 / SCRIPT</span>
+                      <span>{customPayloadInput.length} bytes</span>
+                    </div>
+
+                    <textarea
+                      value={customPayloadInput}
+                      onChange={(e) => {
+                        setCustomPayloadInput(e.target.value);
+                        if (simulatorError) setSimulatorError(null);
+                      }}
+                      rows={2}
+                      placeholder="Paste payload vector, corrupted byte stream, or shellcode hex for isolated neural sandboxing..."
+                      className="w-full bg-transparent text-[#dfe2f1] font-mono text-xs md:text-sm placeholder:text-[#869397] focus:outline-none resize-y min-h-[50px] pt-2"
+                    />
+
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2 pt-2 border-t border-[#3d494c]/20 mt-1">
+                      <div className="flex items-center gap-2">
+                        {customPayloadInput.trim() ? (
+                          <span className="font-mono text-[10px] text-[#4edea3] flex items-center gap-1">
+                            <span className="material-symbols-outlined text-[13px]">check_circle</span>
+                            Buffer Loaded ({customPayloadInput.length}b)
+                          </span>
+                        ) : (
+                          <span className="font-mono text-[10px] text-[#ff7f8b] flex items-center gap-1 animate-pulse">
+                            <span className="material-symbols-outlined text-[13px]">error</span>
+                            Zero-Length Buffer (Empty)
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {customPayloadInput && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCustomPayloadInput('');
+                              setSimulatorError(null);
+                            }}
+                            className="px-2 py-1 text-xs font-mono text-[#869397] hover:text-[#dfe2f1] transition-colors cursor-pointer"
+                          >
+                            Clear
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={handleAnalyzeCustomPayload}
+                          disabled={isAnalyzingPayload}
+                          className="w-full sm:w-auto px-4 py-2 rounded-lg bg-gradient-to-r from-[#06b6d4] to-[#4edea3] text-[#00424f] font-mono text-xs font-bold shadow-[0_0_18px_rgba(6,182,212,0.4)] hover:shadow-[0_0_24px_rgba(78,222,163,0.6)] active:scale-95 transition-all cursor-pointer disabled:opacity-75 flex items-center justify-center gap-1.5"
+                        >
+                          <span className={`material-symbols-outlined text-[16px] ${isAnalyzingPayload ? 'animate-spin' : ''}`}>
+                            {isAnalyzingPayload ? 'sync' : 'security'}
+                          </span>
+                          <span>{isAnalyzingPayload ? 'Sandboxing...' : 'Analyze & Detonate in Sandbox'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Loading State Indicator */}
+                {isAnalyzingPayload && (
+                  <div className="mt-3 p-3.5 rounded-lg bg-[#171b26] border border-[#06b6d4]/50 relative overflow-hidden shadow-[0_0_25px_rgba(6,182,212,0.2)] animate-pulse">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 pb-1">
+                      <div className="flex items-center gap-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#06b6d4] animate-ping" />
+                        <span className="font-mono text-xs font-bold text-[#4cd7f6] uppercase tracking-wider">
+                          Neural Sandbox In Progress...
+                        </span>
+                      </div>
+                      <span className="font-mono text-xs font-bold text-[#4edea3]">
+                        {payloadProgress}% COMPLETED
+                      </span>
+                    </div>
+
+                    {/* Animated Progress Bar */}
+                    <div className="w-full bg-[#0a0e18] h-2 rounded-full overflow-hidden my-2 border border-[#3d494c]/30">
+                      <div
+                        className="h-full bg-gradient-to-r from-[#06b6d4] via-[#4cd7f6] to-[#4edea3] transition-all duration-300"
+                        style={{ width: `${payloadProgress}%` }}
+                      />
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 font-mono text-[11px] text-[#bcc9cd]">
+                      <span className="truncate">{payloadStage}</span>
+                      <span className="text-[#4cd7f6] shrink-0 font-semibold">ISOLATED ENCLAVE #08</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Simulator Error Banner (Validation & Execution Faults) */}
+                {simulatorError && (
+                  <div className="mt-3 p-4 rounded-xl bg-[#ff7f8b]/15 border-2 border-[#ff7f8b]/60 text-[#dfe2f1] shadow-[0_0_30px_rgba(255,127,139,0.25)] animate-shake relative overflow-hidden">
+                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                      <div className="flex items-start gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-lg bg-[#ff7f8b]/20 border border-[#ff7f8b]/40 flex items-center justify-center text-[#ff7f8b] shrink-0 mt-0.5">
+                          <span className="material-symbols-outlined text-[22px]">error</span>
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono text-[10px] font-bold px-2 py-0.5 rounded bg-[#ff7f8b]/30 text-[#ffb4ab] border border-[#ff7f8b]/40 uppercase tracking-wider">
+                              {simulatorError.code}
+                            </span>
+                            <span className="font-mono text-[10px] text-[#869397]">
+                              {simulatorError.timestamp}
+                            </span>
+                          </div>
+                          <h4 className="font-bold text-sm sm:text-base text-[#ffb4ab] mt-1">
+                            {simulatorError.title}
+                          </h4>
+                          <p className="text-xs text-[#bcc9cd] mt-1 leading-relaxed">
+                            {simulatorError.message}
+                          </p>
+                          {simulatorError.details && (
+                            <div className="mt-2 p-2 rounded bg-[#0a0e18] border border-[#ff7f8b]/30 font-mono text-[11px] text-[#ff7f8b] break-all">
+                              <strong>Diagnostics:</strong> {simulatorError.details}
+                            </div>
+                          )}
+                          <div className="mt-2.5 p-2.5 rounded bg-[#1c1f2a] border border-[#3d494c]/30 font-mono text-[11px] text-[#4edea3] flex items-start gap-2">
+                            <span className="material-symbols-outlined text-[16px] shrink-0 text-[#4edea3]">lightbulb</span>
+                            <span><strong>Remediation:</strong> {simulatorError.remediation}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center sm:flex-col gap-2 shrink-0 self-end sm:self-start">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCustomPayloadInput('eval(atob("ZG9jdW1lbnQubG9jYXRpb249J2h0dHA6Ly9tYWxpY2lvdXMtZGVzdC5jb20nOw=="));');
+                            setSimulatorError(null);
+                            setTimeout(() => handleAnalyzeCustomPayload(), 50);
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-[#4edea3]/20 hover:bg-[#4edea3] text-[#4edea3] hover:text-[#00381f] font-mono text-xs font-bold border border-[#4edea3]/40 transition-all cursor-pointer flex items-center gap-1"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">auto_fix_high</span>
+                          <span>Auto-Sanitize</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSimulatorError(null)}
+                          className="px-3 py-1.5 rounded-lg bg-[#262a35] hover:bg-[#313540] text-[#bcc9cd] hover:text-white font-mono text-xs transition-colors cursor-pointer"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Live Telemetry HUD Bar */}
