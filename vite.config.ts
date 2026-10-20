@@ -5,6 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    base: '/cybershield-ai-web/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
